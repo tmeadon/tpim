@@ -127,8 +127,8 @@ type deviceCodeMsg struct {
 	VerificationURL string
 }
 
-func getGraphToken() (string, error) {
-	cachePath := "/home/tom/.gemini/antigravity-cli/pim_token.json"
+func getGraphToken(tenantID, userID string) (string, error) {
+	cachePath := fmt.Sprintf("/home/tom/.gemini/antigravity-cli/pim_token_%s_%s.json", tenantID, userID)
 	
 	// Try reading cache
 	if data, err := os.ReadFile(cachePath); err == nil {
@@ -428,7 +428,7 @@ func initInfoCmd() tea.Msg {
 	}
 }
 
-func fetchRolesCmd(userID string) tea.Cmd {
+func fetchRolesCmd(userID, tenantID string) tea.Cmd {
 	return func() tea.Msg {
 		rolesMap := make(map[string]PimRole)
 
@@ -521,7 +521,7 @@ func fetchRolesCmd(userID string) tea.Cmd {
 
 		// --- B. Entra ID / Directory PIM Roles ---
 		var entraErr error
-		graphToken, err := getGraphToken()
+		graphToken, err := getGraphToken(tenantID, userID)
 		if err != nil {
 			entraErr = fmt.Errorf("Graph auth failed: %w", err)
 		} else {
@@ -620,7 +620,7 @@ func fetchRolesCmd(userID string) tea.Cmd {
 	}
 }
 
-func activateRoleCmd(userID string, role PimRole, justification string, durationHours int) tea.Cmd {
+func activateRoleCmd(userID, tenantID string, role PimRole, justification string, durationHours int) tea.Cmd {
 	return func() tea.Msg {
 		durationStr := fmt.Sprintf("PT%dH", durationHours)
 
@@ -663,7 +663,7 @@ func activateRoleCmd(userID string, role PimRole, justification string, duration
 			}
 
 		} else if role.Type == "Directory Role" {
-			graphToken, err := getGraphToken()
+			graphToken, err := getGraphToken(tenantID, userID)
 			if err != nil {
 				return activateRoleResultMsg{Err: err}
 			}
@@ -699,7 +699,7 @@ func activateRoleCmd(userID string, role PimRole, justification string, duration
 	}
 }
 
-func deactivateRoleCmd(userID string, role PimRole) tea.Cmd {
+func deactivateRoleCmd(userID, tenantID string, role PimRole) tea.Cmd {
 	return func() tea.Msg {
 		if role.Type == "Azure Resource" {
 			reqGUID, err := newUUID()
@@ -730,7 +730,7 @@ func deactivateRoleCmd(userID string, role PimRole) tea.Cmd {
 			}
 
 		} else if role.Type == "Directory Role" {
-			graphToken, err := getGraphToken()
+			graphToken, err := getGraphToken(tenantID, userID)
 			if err != nil {
 				return deactivateRoleResultMsg{Err: err}
 			}
@@ -758,7 +758,7 @@ func deactivateRoleCmd(userID string, role PimRole) tea.Cmd {
 	}
 }
 
-func extendRoleCmd(userID string, role PimRole, justification string, durationHours int) tea.Cmd {
+func extendRoleCmd(userID, tenantID string, role PimRole, justification string, durationHours int) tea.Cmd {
 	return func() tea.Msg {
 		durationStr := fmt.Sprintf("PT%dH", durationHours)
 
@@ -799,7 +799,7 @@ func extendRoleCmd(userID string, role PimRole, justification string, durationHo
 			}
 
 		} else if role.Type == "Directory Role" {
-			graphToken, err := getGraphToken()
+			graphToken, err := getGraphToken(tenantID, userID)
 			if err != nil {
 				return extendRoleResultMsg{Err: err}
 			}
@@ -832,6 +832,49 @@ func extendRoleCmd(userID string, role PimRole, justification string, durationHo
 		}
 
 		return extendRoleResultMsg{}
+	}
+}
+
+type AzureAccount struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	TenantID  string `json:"tenantId"`
+	User      struct {
+		Name string `json:"name"`
+	} `json:"user"`
+	IsDefault bool   `json:"isDefault"`
+}
+
+type fetchAccountsMsg struct {
+	Accounts []AzureAccount
+	Err      error
+}
+
+type switchAccountResultMsg struct {
+	Err error
+}
+
+func fetchAccountsCmd() tea.Cmd {
+	return func() tea.Msg {
+		out, err := runAzCmd("account", "list", "--output", "json")
+		if err != nil {
+			return fetchAccountsMsg{Err: err}
+		}
+		var accounts []AzureAccount
+		if err := json.Unmarshal([]byte(out), &accounts); err != nil {
+			return fetchAccountsMsg{Err: err}
+		}
+		return fetchAccountsMsg{Accounts: accounts}
+	}
+}
+
+func switchAccountCmd(subscriptionID string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := runAzCmd("account", "set", "--subscription", subscriptionID)
+		if err != nil {
+			return switchAccountResultMsg{Err: err}
+		}
+		return switchAccountResultMsg{}
 	}
 }
 
@@ -868,6 +911,12 @@ type model struct {
 	deviceCode         string
 	deviceUrl          string
 
+	// Switch Account State
+	accounts           []AzureAccount
+	filteredAccounts   []AzureAccount
+	accountCursor      int
+	accountFilterInput textinput.Model
+
 	spinner            spinner.Model
 }
 
@@ -887,13 +936,41 @@ func initialModel() model {
 	di.CharLimit = 2
 	di.Width = 5
 
+	ai := textinput.New()
+	ai.Placeholder = "Search subscriptions/tenants..."
+	ai.CharLimit = 50
+	ai.Width = 30
+
 	return model{
 		state:              "init",
 		loadingMsg:         "Initializing, checking Azure session...",
 		spinner:            s,
 		justificationInput: ji,
 		durationInput:      di,
+		accountFilterInput: ai,
 		focusedInput:       0,
+	}
+}
+
+func (m *model) updateFilteredAccounts() {
+	query := strings.ToLower(strings.TrimSpace(m.accountFilterInput.Value()))
+	if query == "" {
+		m.filteredAccounts = m.accounts
+	} else {
+		var filtered []AzureAccount
+		for _, acct := range m.accounts {
+			if strings.Contains(strings.ToLower(acct.Name), query) ||
+				strings.Contains(strings.ToLower(acct.TenantID), query) ||
+				strings.Contains(strings.ToLower(acct.User.Name), query) {
+				filtered = append(filtered, acct)
+			}
+		}
+		m.filteredAccounts = filtered
+	}
+
+	// Clamp cursor
+	if m.accountCursor >= len(m.filteredAccounts) {
+		m.accountCursor = max(0, len(m.filteredAccounts)-1)
 	}
 }
 
@@ -930,6 +1007,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.deviceUrl = msg.VerificationURL
 		return m, nil
 
+	case fetchAccountsMsg:
+		if msg.Err != nil {
+			m.state = "error"
+			m.err = msg.Err
+			return m, nil
+		}
+		m.accounts = msg.Accounts
+		m.accountFilterInput.SetValue("")
+		m.updateFilteredAccounts()
+		
+		m.accountCursor = 0
+		for i, acct := range m.filteredAccounts {
+			if acct.IsDefault {
+				m.accountCursor = i
+				break
+			}
+		}
+		m.state = "switch_account_modal"
+		m.accountFilterInput.Focus()
+		return m, nil
+
+	case switchAccountResultMsg:
+		if msg.Err != nil {
+			m.state = "error"
+			m.err = msg.Err
+			return m, nil
+		}
+		m.state = "loading"
+		m.loadingMsg = "Context switched! Re-initializing session..."
+		return m, initInfoCmd
+
 	case initInfoMsg:
 		if msg.Err != nil {
 			m.state = "error"
@@ -943,7 +1051,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.state = "loading"
 		m.loadingMsg = "Fetching eligible Entra PIM roles..."
-		return m, fetchRolesCmd(m.userID)
+		return m, fetchRolesCmd(m.userID, m.tenantID)
 
 	case fetchRolesMsg:
 		if msg.Err != nil {
@@ -970,7 +1078,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.state = "loading"
 		m.loadingMsg = "Success! Reloading roles..."
-		return m, fetchRolesCmd(m.userID)
+		return m, fetchRolesCmd(m.userID, m.tenantID)
 
 	case deactivateRoleResultMsg:
 		m.submitting = false
@@ -981,7 +1089,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.state = "loading"
 		m.loadingMsg = "Deactivated successfully! Reloading roles..."
-		return m, fetchRolesCmd(m.userID)
+		return m, fetchRolesCmd(m.userID, m.tenantID)
 
 	case extendRoleResultMsg:
 		m.submitting = false
@@ -992,7 +1100,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.state = "loading"
 		m.loadingMsg = "Extended successfully! Reloading roles..."
-		return m, fetchRolesCmd(m.userID)
+		return m, fetchRolesCmd(m.userID, m.tenantID)
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
@@ -1017,7 +1125,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				m.state = "loading"
 				m.loadingMsg = "Refreshing PIM roles..."
-				return m, fetchRolesCmd(m.userID)
+				return m, fetchRolesCmd(m.userID, m.tenantID)
+			case "s":
+				m.state = "loading"
+				m.loadingMsg = "Listing available Azure accounts..."
+				return m, fetchAccountsCmd()
 			case "up", "k":
 				if m.cursor > 0 {
 					m.cursor--
@@ -1085,7 +1197,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.submitting = true
 				m.state = "loading"
 				m.loadingMsg = fmt.Sprintf("Deactivating role %s...", m.selectedRole.RoleName)
-				return m, deactivateRoleCmd(m.userID, m.selectedRole)
+				return m, deactivateRoleCmd(m.userID, m.tenantID, m.selectedRole)
 			}
 
 		case "modal":
@@ -1131,10 +1243,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = "loading"
 				if m.modalAction == "extend" {
 					m.loadingMsg = fmt.Sprintf("Submitting extension for %s...", m.selectedRole.RoleName)
-					return m, extendRoleCmd(m.userID, m.selectedRole, justification, hours)
+					return m, extendRoleCmd(m.userID, m.tenantID, m.selectedRole, justification, hours)
 				} else {
 					m.loadingMsg = fmt.Sprintf("Submitting activation for %s...", m.selectedRole.RoleName)
-					return m, activateRoleCmd(m.userID, m.selectedRole, justification, hours)
+					return m, activateRoleCmd(m.userID, m.tenantID, m.selectedRole, justification, hours)
 				}
 			}
 
@@ -1145,6 +1257,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.durationInput, cmd = m.durationInput.Update(msg)
 				return m, cmd
 			}
+
+		case "switch_account_modal":
+			switch msg.String() {
+			case "esc":
+				if m.accountFilterInput.Value() != "" {
+					m.accountFilterInput.SetValue("")
+					m.updateFilteredAccounts()
+					return m, nil
+				}
+				m.state = "ready"
+				return m, nil
+			case "up", "k":
+				if m.accountCursor > 0 {
+					m.accountCursor--
+				}
+				return m, nil
+			case "down", "j":
+				if m.accountCursor < len(m.filteredAccounts)-1 {
+					m.accountCursor++
+				}
+				return m, nil
+			case "enter":
+				if len(m.filteredAccounts) > 0 {
+					acct := m.filteredAccounts[m.accountCursor]
+					m.state = "loading"
+					m.loadingMsg = fmt.Sprintf("Switching context to %s...", acct.Name)
+					return m, switchAccountCmd(acct.ID)
+				}
+				return m, nil
+			}
+
+			var cmd tea.Cmd
+			prevVal := m.accountFilterInput.Value()
+			m.accountFilterInput, cmd = m.accountFilterInput.Update(msg)
+			if m.accountFilterInput.Value() != prevVal {
+				m.updateFilteredAccounts()
+			}
+			return m, cmd
 		}
 	}
 
@@ -1223,6 +1373,56 @@ func (m model) View() string {
 		content.WriteString("This will terminate your privileged session immediately.\n\n")
 		content.WriteString(lipgloss.NewStyle().Faint(true).Render("Press [Enter] confirm deactivation  |  [Esc] cancel"))
 
+		dialog := modalStyle.Render(content.String())
+		sb.WriteString(lipgloss.Place(m.width, m.height-6, lipgloss.Center, lipgloss.Center, dialog))
+
+	case "switch_account_modal":
+		var content strings.Builder
+		content.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7aa2f7")).Render("◤ SWITCH AZURE CONTEXT ◢\n\n"))
+		
+		content.WriteString("Search: " + m.accountFilterInput.View() + "\n\n")
+		
+		if len(m.filteredAccounts) == 0 {
+			content.WriteString("No matching accounts found.")
+		} else {
+			maxRows := m.height - 10
+			if maxRows > 8 {
+				maxRows = 8
+			}
+			maxRows = max(3, maxRows)
+			
+			start := max(0, m.accountCursor - maxRows + 2)
+			end := min(len(m.filteredAccounts), start + maxRows)
+			
+			for i := start; i < end; i++ {
+				acct := m.filteredAccounts[i]
+				marker := "  "
+				var style lipgloss.Style
+				if i == m.accountCursor {
+					marker = "▸ "
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7")).Bold(true)
+				} else {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color("#a9b1d6"))
+				}
+				
+				defaultStr := ""
+				if acct.IsDefault {
+					defaultStr = " (current)"
+				}
+				
+				acctInfo := fmt.Sprintf("%s%s  (Tenant: %s | User: %s)", acct.Name, defaultStr, acct.TenantID, acct.User.Name)
+				content.WriteString(style.Render(marker+padTrunc(acctInfo, m.width-8)) + "\n")
+			}
+			content.WriteString("\n")
+			
+			if len(m.filteredAccounts) > maxRows {
+				pageInfo := fmt.Sprintf("Showing %d-%d of %d accounts (use arrows to scroll)", start+1, end, len(m.filteredAccounts))
+				content.WriteString(lipgloss.NewStyle().Faint(true).Render("   "+pageInfo) + "\n\n")
+			}
+		}
+		
+		content.WriteString(lipgloss.NewStyle().Faint(true).Render("Press [Enter] switch context  |  [Esc] clear/close"))
+		
 		dialog := modalStyle.Render(content.String())
 		sb.WriteString(lipgloss.Place(m.width, m.height-6, lipgloss.Center, lipgloss.Center, dialog))
 
@@ -1353,7 +1553,7 @@ func (m model) View() string {
 	legend := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#ffffff")).
 		Background(lipgloss.Color("#3b4261")).
-		Render(" [↑/↓/j/k] Navigate  [Enter/a] Activate  [d] Deactivate  [e] Extend  [r] Refresh  [q] Quit ")
+		Render(" [↑/↓/j/k] Navigate  [Enter/a] Activate  [d] Deactivate  [e] Extend  [s] Switch  [r] Refresh  [q] Quit ")
 
 	footerSpaces := max(0, m.width-lipgloss.Width(statusVal)-lipgloss.Width(legend))
 	sb.WriteString(statusVal + strings.Repeat(" ", footerSpaces) + legend)
